@@ -106,6 +106,12 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Edge views (EE-VLA), uint8 in [0, 255]. Read only by the PyTorch pi05 model's edge encoders, so
+    # they skip the SigLIP image preprocessing.
+    edge_images: dict[str, at.UInt8[ArrayT, "*b eh ew ec"]] | None = None
+    # Edge view masks, with same keys as edge_images.
+    edge_image_masks: dict[str, at.Bool[ArrayT, "*b"]] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -126,6 +132,8 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            edge_images=data.get("edge_image"),
+            edge_image_masks=data.get("edge_image_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -133,6 +141,8 @@ class Observation(Generic[ArrayT]):
         result = dataclasses.asdict(self)
         result["image"] = result.pop("images")
         result["image_mask"] = result.pop("image_masks")
+        result["edge_image"] = result.pop("edge_images")
+        result["edge_image_mask"] = result.pop("edge_image_masks")
         return result
 
 

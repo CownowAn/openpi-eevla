@@ -7,6 +7,7 @@ from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
+from openpi.models_pytorch.edge_vision import EdgeVisionEncoder
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
@@ -108,6 +109,23 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
+        # Edge-view tokens (see `pi0_config.EdgePlacement`), sized for the transformer that reads them.
+        self.edge_placement = config.edge_placement
+        self.edge_vision = None
+        if config.use_edge:
+            # Imported here: openpi.models.model imports this module, and pi0_config imports model.
+            from openpi.models.pi0_config import PREFIX_EDGE_PLACEMENTS  # noqa: PLC0415
+
+            prefix_edge = self.edge_placement in PREFIX_EDGE_PLACEMENTS
+            self.edge_vision = EdgeVisionEncoder(
+                num_views=len(config.edge_image_keys),
+                out_dim=paligemma_config.width if prefix_edge else action_expert_config.width,
+                model_name=config.edge_encoder_model,
+                dropout_p=config.edge_dropout_p,
+            )
+        if config.vlm_train_mode == "frozen":
+            self.paligemma_with_expert.paligemma.requires_grad_(False)
+
         torch.set_float32_matmul_precision("high")
         if config.pytorch_compile_mode is not None:
             self.sample_actions = torch.compile(self.sample_actions, mode=config.pytorch_compile_mode)
@@ -184,15 +202,44 @@ class PI0Pytorch(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
 
+    def _embed_edge(self, observation):
+        """Edge tokens [B, V, D] and their keep mask [B, V] (view masks with training-time dropout)."""
+        if self.edge_vision is None:
+            return None, None
+        keys = self.config.edge_image_keys
+        pixels = torch.stack([observation.edge_images[key] for key in keys], dim=1)
+        if observation.edge_image_masks is None:
+            view_masks = torch.ones(pixels.shape[:2], dtype=torch.bool, device=pixels.device)
+        else:
+            view_masks = torch.stack([observation.edge_image_masks[key] for key in keys], dim=1)
+        return self.edge_vision.tokens_and_keep(pixels, view_masks, torch.float32)
+
+    def _action_outputs(self, suffix_out):
+        """The action tokens' outputs: the last `action_horizon` suffix tokens (the first ones for B2)."""
+        if self.edge_placement == "B2":
+            return suffix_out[:, : self.config.action_horizon]
+        return suffix_out[:, -self.config.action_horizon :]
+
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self, images, img_masks, lang_tokens, lang_masks, edge_tokens=None, edge_keep=None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
+
+        Returns embeddings, pad masks, attention masks and position masks. Position masks equal the pad
+        masks except that edge tokens always take a position, so that dropping them (training-time
+        dropout) does not shift the positions of the tokens after them.
         """
         embs = []
         pad_masks = []
+        pos_masks = []
         att_masks = []
+
+        def add_edge(*, new_block):
+            embs.append(edge_tokens.to(embs[-1].dtype))
+            pad_masks.append(edge_keep)
+            pos_masks.append(torch.ones_like(edge_keep))
+            att_masks.extend([int(new_block)] + [0] * (edge_tokens.shape[1] - 1))
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
@@ -206,9 +253,13 @@ class PI0Pytorch(nn.Module):
 
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+            pos_masks.append(pad_masks[-1])
 
             # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
+
+        if self.edge_placement == "A3":
+            add_edge(new_block=False)
 
         # Process language tokens
         def lang_embed_func(lang_tokens):
@@ -220,23 +271,32 @@ class PI0Pytorch(nn.Module):
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
+        pos_masks.append(lang_masks)
 
         # full attention between image and language inputs
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
+        # A1: image and language tokens do not attend to the edge tokens.
+        if self.edge_placement in ("A1", "A2"):
+            add_edge(new_block=self.edge_placement == "A1")
+
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
+        pos_masks = torch.cat(pos_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
 
         # Get batch size from the first dimension of the concatenated tensors
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
-        return embs, pad_masks, att_masks
+        return embs, pad_masks, att_masks, pos_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep):
-        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
+    def embed_suffix(self, state, noisy_actions, timestep, edge_tokens=None, edge_keep=None):
+        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing.
+
+        Also returns position masks (see `embed_prefix`).
+        """
         embs = []
         pad_masks = []
         att_masks = []
@@ -297,22 +357,40 @@ class PI0Pytorch(nn.Module):
             action_time_emb = action_emb
             adarms_cond = time_emb
 
-        # Add to input tokens
-        embs.append(action_time_emb)
-
         bsize, action_time_dim = action_time_emb.shape[:2]
         action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
-        pad_masks.append(action_time_mask)
+        pos_masks = list(pad_masks)
 
-        # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] + ([0] * (self.config.action_horizon - 1))
+        def add_edge(*, new_block):
+            embs.append(edge_tokens.to(action_time_emb.dtype))
+            pad_masks.append(edge_keep)
+            pos_masks.append(torch.ones_like(edge_keep))
+            att_masks.extend([int(new_block)] + [0] * (edge_tokens.shape[1] - 1))
+
+        # B1 / B3: edge tokens before the actions, in their own block (prefix tokens do not attend to them).
+        if self.edge_placement in ("B1", "B3"):
+            add_edge(new_block=True)
+
+        # Add to input tokens
+        embs.append(action_time_emb)
+        pad_masks.append(action_time_mask)
+        pos_masks.append(action_time_mask)
+
+        # Set attention masks so that image, language and state inputs do not attend to action tokens.
+        # B3: the actions join the edge block, so edge and action tokens attend to each other.
+        att_masks += [int(self.edge_placement != "B3")] + ([0] * (self.config.action_horizon - 1))
+
+        # B2: edge tokens after the actions, in the action block.
+        if self.edge_placement == "B2":
+            add_edge(new_block=False)
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
+        pos_masks = torch.cat(pos_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
-        return embs, pad_masks, att_masks, adarms_cond
+        return embs, pad_masks, att_masks, adarms_cond, pos_masks
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
@@ -328,8 +406,24 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        v_t = self._predict_velocity((images, img_masks, lang_tokens, lang_masks, state), observation, x_t, time)
+        return F.mse_loss(u_t, v_t, reduction="none")
+
+    def _predict_velocity(self, preprocessed, observation, x_t, time) -> Tensor:
+        """Velocity v_t from a single forward pass over prefix and suffix (the training-time path).
+
+        `preprocessed` is the output of `_preprocess_observation`; the edge views are read from
+        `observation`.
+        """
+        images, img_masks, lang_tokens, lang_masks, state = preprocessed
+        edge_tokens, edge_keep = self._embed_edge(observation)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks, prefix_pos_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, edge_tokens, edge_keep
+        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond, suffix_pos_masks = self.embed_suffix(
+            state, x_t, time, edge_tokens, edge_keep
+        )
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
@@ -341,7 +435,7 @@ class PI0Pytorch(nn.Module):
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        position_ids = torch.cumsum(torch.cat([prefix_pos_masks, suffix_pos_masks], dim=1), dim=1) - 1
 
         # Prepare attention masks
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
@@ -362,16 +456,14 @@ class PI0Pytorch(nn.Module):
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
-        suffix_out = suffix_out[:, -self.config.action_horizon :]
+        suffix_out = self._action_outputs(suffix_out)
         suffix_out = suffix_out.to(dtype=torch.float32)
 
         # Apply gradient checkpointing to final action projection if enabled
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
-
-        return F.mse_loss(u_t, v_t, reduction="none")
+        return self._apply_checkpoint(action_out_proj_func, suffix_out)
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
@@ -382,10 +474,14 @@ class PI0Pytorch(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        # The edge encoders run once; suffix placements re-embed the same tokens at every step.
+        edge_tokens, edge_keep = self._embed_edge(observation)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks, prefix_pos_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, edge_tokens, edge_keep
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_position_ids = torch.cumsum(prefix_pos_masks, dim=1) - 1
 
         # Compute image and language key value cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
@@ -412,6 +508,9 @@ class PI0Pytorch(nn.Module):
                 past_key_values,
                 x_t,
                 expanded_time,
+                prefix_pos_masks=prefix_pos_masks,
+                edge_tokens=edge_tokens,
+                edge_keep=edge_keep,
             )
 
             # Euler step - use new tensor assignment instead of in-place operation
@@ -426,9 +525,16 @@ class PI0Pytorch(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        prefix_pos_masks=None,
+        edge_tokens=None,
+        edge_keep=None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond, suffix_pos_masks = self.embed_suffix(
+            state, x_t, timestep, edge_tokens, edge_keep
+        )
+        if prefix_pos_masks is None:
+            prefix_pos_masks = prefix_pad_masks
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -440,8 +546,8 @@ class PI0Pytorch(nn.Module):
 
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
 
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        prefix_offsets = torch.sum(prefix_pos_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pos_masks, dim=1) - 1
 
         # Prepare attention masks
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
@@ -457,6 +563,6 @@ class PI0Pytorch(nn.Module):
         )
 
         suffix_out = outputs_embeds[1]
-        suffix_out = suffix_out[:, -self.config.action_horizon :]
+        suffix_out = self._action_outputs(suffix_out)
         suffix_out = suffix_out.to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)

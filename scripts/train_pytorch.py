@@ -443,9 +443,15 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
+        model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        missing, unexpected = safetensors.torch.load_model(model_to_load, model_path, strict=False)
+        # Only the edge encoders may be missing (a base checkpoint has none); they start from pretrained DINOv3.
+        not_edge = [key for key in missing if not key.startswith("edge_vision.")]
+        if not_edge or unexpected:
+            raise ValueError(f"Checkpoint mismatch: missing {not_edge}, unexpected {unexpected}")
+        if missing:
+            model_to_load.edge_vision.load_pretrained_encoders()
+            logging.info(f"Initialized the edge encoders from pretrained {model_cfg.edge_encoder_model}")
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     # Optimizer + learning rate schedule from config
@@ -455,8 +461,9 @@ def train_loop(config: _config.TrainConfig):
     end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
+    # Frozen parameters (vlm_train_mode="frozen") stay out of the optimizer.
     optim = torch.optim.AdamW(
-        model.parameters(),
+        [param for param in model.parameters() if param.requires_grad],
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,

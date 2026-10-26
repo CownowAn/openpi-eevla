@@ -19,6 +19,7 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.gr1_policy as gr1_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -223,6 +224,86 @@ class SimpleDataConfig(DataConfigFactory):
             data_transforms=self.data_transforms(model_config),
             model_transforms=self.model_transforms(model_config),
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotGR1DataConfig(DataConfigFactory):
+    """GR1 multi-view tabletop datasets (GR00T LeRobot format).
+
+    The dataset is read from `$HF_LEROBOT_HOME/<repo_id>`. `vlm_views` go to the SigLIP image slots and
+    `edge_views` to the edge encoders; both are the dataset's `observation.images.<view>` names.
+    """
+
+    vlm_views: tuple[str, ...] = ("ego_view",)
+    edge_views: tuple[str, ...] = ()
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        views = (*self.vlm_views, *self.edge_views)
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        **{f"observation/images/{view}": f"observation.images.{view}" for view in views},
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[
+                gr1_policy.GR1Inputs(
+                    model_type=model_config.model_type, vlm_views=self.vlm_views, edge_views=self.edge_views
+                )
+            ],
+            outputs=[gr1_policy.GR1Outputs()],
+        ).push(
+            inputs=[_transforms.DeltaActions(gr1_policy.GR1_DELTA_MASK)],
+            outputs=[_transforms.AbsoluteActions(gr1_policy.GR1_DELTA_MASK)],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+def _gr1_colorbutton_configs() -> list["TrainConfig"]:
+    """pi05 on GR1 ColorButtonBoxV3 (L3), cam3b views: ego + left/right wrist-inner.
+
+    `pi05_gr1_colorbutton_cam3b` puts all three views through SigLIP; the `_edge_<placement>` configs put
+    the ego view through SigLIP and the two wrist views through per-view DINOv3 edge encoders (EE-VLA).
+    """
+    repo_id = "gr1_mv.ColorButtonBoxV3_L3"
+    wrist_views = ("left_wrist_inner", "right_wrist_inner")
+    # One set of norm stats for every variant (state and actions do not depend on the views), computed with
+    # `scripts/compute_norm_stats.py --config-name pi05_gr1_colorbutton_cam3b`, which writes them here.
+    assets = AssetsConfig(assets_dir="./assets/pi05_gr1_colorbutton_cam3b", asset_id=repo_id)
+
+    def make(name, model, vlm_views, edge_views=()):
+        return TrainConfig(
+            name=name,
+            model=model,
+            data=LeRobotGR1DataConfig(
+                repo_id=repo_id,
+                assets=assets,
+                # The dataset's action column is "action" (openpi's default is "actions").
+                base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+                vlm_views=vlm_views,
+                edge_views=edge_views,
+            ),
+            pytorch_weight_path="/nfs/data/sohyun/checkpoints/openpi/pi05_base_pytorch",
+        )
+
+    configs = [make("pi05_gr1_colorbutton_cam3b", pi0_config.Pi0Config(pi05=True), ("ego_view", *wrist_views))]
+    for placement in (*pi0_config.PREFIX_EDGE_PLACEMENTS, *pi0_config.SUFFIX_EDGE_PLACEMENTS):
+        model = pi0_config.Pi0Config(pi05=True, edge_placement=placement, edge_image_keys=wrist_views)
+        configs.append(make(f"pi05_gr1_colorbutton_cam3b_edge_{placement}", model, ("ego_view",), wrist_views))
+    return configs
 
 
 @dataclasses.dataclass(frozen=True)
@@ -965,6 +1046,8 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
+    # GR1 multi-view (edge token) configs.
+    *_gr1_colorbutton_configs(),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),

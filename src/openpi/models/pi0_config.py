@@ -1,5 +1,5 @@
 import dataclasses
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import flax.nnx as nnx
 import jax
@@ -13,6 +13,19 @@ import openpi.shared.nnx_utils as nnx_utils
 
 if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
+
+# Where the edge-view tokens (EE-VLA: one DINOv3 CLS token per extra camera) enter the sequence.
+# Prefix placements are processed by the PaliGemma weights, suffix placements by the action expert.
+#   A1: [img][text][edge] prefix, edge in its own block (image/text tokens do not attend to it)
+#   A2: [img][text][edge] prefix, one bidirectional block
+#   A3: [img][edge][text] prefix, one bidirectional block
+#   B1: [edge][act] suffix, separate blocks (edge does not attend to the actions)
+#   B2: [act][edge] suffix, one block (actions keep their original positions)
+#   B3: [edge][act] suffix, one block
+EdgePlacement = Literal["none", "A1", "A2", "A3", "B1", "B2", "B3"]
+PREFIX_EDGE_PLACEMENTS = ("A1", "A2", "A3")
+SUFFIX_EDGE_PLACEMENTS = ("B1", "B2", "B3")
+EDGE_IMAGE_RESOLUTION = (256, 256)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -34,6 +47,16 @@ class Pi0Config(_model.BaseModelConfig):
 
     pytorch_compile_mode: str | None = "max-autotune"
 
+    # Edge-view tokens (PyTorch model only). `edge_image_keys` names the observation's `edge_images`
+    # entries, one trainable encoder per key.
+    edge_placement: EdgePlacement = "none"
+    edge_image_keys: tuple[str, ...] = ()
+    edge_encoder_model: str = "vit_base_patch16_dinov3.lvd1689m"
+    # Training-time edge dropout: with this probability a sample has all of its edge tokens masked out.
+    edge_dropout_p: float = 0.2
+    # "frozen" freezes the PaliGemma backbone (SigLIP + Gemma 2B); the action expert always trains.
+    vlm_train_mode: Literal["full", "frozen"] = "full"
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
@@ -46,6 +69,14 @@ class Pi0Config(_model.BaseModelConfig):
                 "max-autotune",
                 "max-autotune-no-cudagraphs",
             ]
+        if (self.edge_placement == "none") != (not self.edge_image_keys):
+            raise ValueError("edge_placement and edge_image_keys must be set together.")
+        if self.edge_placement != "none" and not self.pi05:
+            raise ValueError("Edge tokens are only supported for pi05.")
+
+    @property
+    def use_edge(self) -> bool:
+        return self.edge_placement != "none"
 
     @property
     @override
@@ -80,6 +111,12 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                edge_images={
+                    key: jax.ShapeDtypeStruct([batch_size, *EDGE_IMAGE_RESOLUTION, 3], jnp.uint8)
+                    for key in self.edge_image_keys
+                }
+                or None,
+                edge_image_masks=dict.fromkeys(self.edge_image_keys, image_mask_spec) or None,
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 
